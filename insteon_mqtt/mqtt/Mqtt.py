@@ -7,6 +7,7 @@ import functools
 import json
 import logging
 from .. import log
+from ..Listeners import Listeners
 from . import config
 from .MsgTemplate import MsgTemplate
 from .Reply import Reply
@@ -90,6 +91,11 @@ class Mqtt:
         # Loaded config object.
         self._config = None
 
+        # RF listeners (Listeners.py).  Only created when the config has a
+        # 'listeners' section, so nothing changes for anyone who doesn't use
+        # them.
+        self.listeners = None
+
     #-----------------------------------------------------------------------
     def load_config(self, data):
         """Load a configuration dictionary.
@@ -147,6 +153,12 @@ class Mqtt:
 
         # Save the config for later passing to devices when they are created.
         self._config = data
+
+        # RF listeners.
+        self.listeners = None
+        if data.get('listeners'):
+            self.listeners = Listeners(self, self.modem, self.modem.protocol)
+            self.listeners.load_config(data['listeners'])
 
         # Subscribe to the new topics.
         if self.link.connected:
@@ -427,6 +439,9 @@ class Mqtt:
             self.link.subscribe(self._ha_status_topic, self.qos,
                                 self.handle_ha_status)
 
+        if self.listeners:
+            self.listeners.subscribe(self.link, self.qos)
+
         for device in self.devices.values():
             device.subscribe(self.link, self.qos)
             self._publish_device_discovery(device)
@@ -439,6 +454,9 @@ class Mqtt:
         """
         if self._cmd_topic:
             self.link.unsubscribe(self._cmd_topic + "/+")
+
+        if self.listeners:
+            self.listeners.unsubscribe(self.link)
 
         for device in self.devices.values():
             device.unsubscribe(self.link)

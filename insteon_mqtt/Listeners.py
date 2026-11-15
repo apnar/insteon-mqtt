@@ -1,0 +1,864 @@
+#===========================================================================
+#
+# RF listeners: extra receivers for messages the modem missed
+#
+#===========================================================================
+"""Use additional RF receivers to hear what the modem missed.
+
+A PLM hears only what reaches its own antenna, and passes up only the group
+broadcasts it holds a link for.  Battery devices (leak, door, motion,
+remotes) are RF only and cannot be polled, so a message the modem misses
+from one of them is simply lost.  Receive-only RF listeners placed around
+the house (for example a LilyGO T-Embed CC1101 running ESPHome, or an
+RTL-SDR) decode what they hear and publish it to MQTT.  This class compares
+what they heard with what the modem heard and hands the modem's misses to
+the protocol stack, as though the modem had heard them itself.  Nothing is
+ever transmitted: the modem stays the only transmitter.
+
+Listener messages (topic default 'insteon-rf/msg/+'):
+
+    {"v": 1, "rx": "t-embed", "t": 1794759872.429,
+     "frame": "0250294E522B9307270D02", "copies": 3, "hops_left": 2,
+     "rssi": -78.5, "snr": null, "repaired": 0}
+
+'frame' is the message exactly as the modem would have reported it (0x50
+standard or 0x51 extended), 't' the time it was on the air and 'repaired'
+the number of bits the listener had to correct (0 = clean).
+
+For each message (all times are insteon-mqtt's own clock at arrival; a
+listener's 't' is only checked for being finite and recent):
+
+1. Hold it for 'grace' seconds.  The modem's own copy also travels the
+   powerline and often arrives after a listener's.
+2. Do nothing if the modem read it (or the same event in its other form:
+   the cleanup of a broadcast), if the modem has since read a newer message
+   for the same group from the same device (injecting would replay old
+   state), if it is addressed to another device, or if it is a group
+   broadcast the modem has no responder link for (the modem would never
+   pass it up).  Listener copies of the same bytes within 0.5 s on air are
+   one transmission; each modem read is credited to at most one of them.
+3. Otherwise classify it.  'battery': a broadcast or cleanup from a battery
+   device.  'group': any other group broadcast or cleanup.  'state': any
+   other message to the modem.  Never handled: ACK/NAK replies, cleanup
+   status reports (0x06, no state of their own), the modem's own
+   transmissions, senders that are not in the config, repaired messages,
+   and group 0 (which raises an alert).
+4. Inject it if its tier is listed in 'inject', log it if listed in
+   'shadow', within rate limits (per device and overall, per minute; shadow
+   decisions have their own budget).  Messages are released oldest first.
+   After an injection the modem's own late copy (or the other form of the
+   same event) is dropped before insteon-mqtt handles it.
+
+Config, under the mqtt section:
+
+    listeners:
+      topic: 'insteon-rf/msg/+'
+      inject: ['battery']
+      shadow: ['group', 'state']
+      stats_topic: 'insteon/listeners/stats'
+      stats_interval: 300
+      alert_topic: 'insteon/listeners/alert'
+"""
+#===========================================================================
+import json
+import math
+import time
+
+from . import log
+from . import message as Msg
+from .device.BatterySensor import BatterySensor
+from .device.Leak import Leak
+
+LOG = log.get_logger()
+
+TIERS = ('battery', 'group', 'state')
+
+_GROUP_TYPES = (Msg.Flags.Type.ALL_LINK_BROADCAST,
+                Msg.Flags.Type.ALL_LINK_CLEANUP)
+_REPLY_TYPES = (Msg.Flags.Type.DIRECT_ACK, Msg.Flags.Type.DIRECT_NAK,
+                Msg.Flags.Type.CLEANUP_ACK, Msg.Flags.Type.CLEANUP_NAK)
+
+
+def message_key(frame):
+    """Hop-insensitive identity of a modem frame.
+
+    Two copies of one transmission differ only in the hops-left bits of the
+    flags byte, so those are masked out and everything else is kept.
+
+    Args:
+      frame (bytes):  A complete 0x50 or 0x51 frame.
+
+    Returns:
+      bytes:  The key.
+    """
+    return bytes(frame[1:8]) + bytes([frame[8] & ~0x0C & 0xFF]) + \
+        bytes(frame[9:])
+
+
+def _other_form(a, b):
+    """Whether two keys are a broadcast and a cleanup (either way round).
+
+    Args:
+      a, b (bytes):  Keys from message_key().
+
+    Returns:
+      bool
+    """
+    kinds = {a[7] >> 5, b[7] >> 5}
+    return kinds == {Msg.Flags.Type.ALL_LINK_BROADCAST,
+                     Msg.Flags.Type.ALL_LINK_CLEANUP}
+
+
+def _topic(key):
+    """What a message is about, from its message_key().
+
+    Args:
+      key (bytes):  A key from message_key().
+
+    Returns:
+      (int, int, int):  (sender id, group or None, cmd1).  The group is set
+      only for group broadcasts (the low byte of 'to') and cleanups (cmd2),
+      and never for replies or cleanup status reports (0x06), which carry
+      no state of their own.
+    """
+    sender = (key[1] << 16) | (key[2] << 8) | key[3]
+    kind = key[7] >> 5
+    cmd1, cmd2 = key[8], key[9]
+    group = None
+    if kind == Msg.Flags.Type.ALL_LINK_BROADCAST and cmd1 != 0x06:
+        group = key[6]
+    elif kind == Msg.Flags.Type.ALL_LINK_CLEANUP:
+        group = cmd2
+    return sender, group, cmd1
+
+
+class Listeners:
+    """Correlate RF listeners with the modem and inject what it missed."""
+
+    # Two clocks.  Decisions about the modem use insteon-mqtt's own clock at
+    # arrival ('first', 'when').  Which listener copies are one transmission,
+    # and which of two transmissions came first, use the listeners' on-air
+    # time 't' (checked to be finite and recent; the listeners agree to a
+    # few ms).
+    #
+    # Seconds to wait, after the first listener copy arrives, for the
+    # modem's own copy (it can arrive later: it also travels the powerline).
+    GRACE_S = 2.5
+    # The modem's copy counts if it was read up to this long before the
+    # first listener copy arrived (listeners publish ~0.75 s after the air;
+    # the modem's copy can be of an earlier retransmission).
+    EARLY_S = 2.5
+    # Listener copies of the same bytes this close on air are one
+    # transmission; further apart they are separate ones (repeat presses).
+    # Each listener stamps the earliest hop copy *it* heard (up to ~150 ms
+    # apart between listeners) and folds its own copies over 0.5 s, so one
+    # listener never sends the same bytes twice inside this.
+    SAME_TX_S = 0.5
+    # Same bytes from a different listener within this, but beyond
+    # SAME_TX_S: probably one transmission split by listener clock skew.
+    # Counted ('split') so shadow mode shows it; it would double-process.
+    SPLIT_S = 1.0
+    # A listener copy places a modem read in order only if it arrived
+    # within this of the read (it is then the same transmission).
+    MATCH_S = 2.0
+    # A modem read of the same bytes this close on air means the modem
+    # handled the event even if that read was credited to another event: a
+    # device's own retransmission (0.5-1.4 s later) is the same event.
+    SAME_EVENT_S = 2.0
+    # Listeners publish this long after the air (measured median 0.75 s).
+    # Used to place a listener arrival on the air without trusting the
+    # listener's clock.
+    LISTENER_LAG_S = 0.75
+    # After an injection, the modem's own late copy of the same bytes is
+    # ignored for this long (the other form of the event, for PAIR_S).
+    STRAGGLER_S = 1.0
+    # Listener evidence older or newer than this is not used for ordering.
+    ORDER_S = 5.0
+    # A broadcast and its cleanup are one event if this close on air
+    # (measured gap p99 5.3 s): either form read by the modem, or injected,
+    # handles the other.
+    PAIR_S = 8.0
+    # Listener messages whose 't' is further than this from now are dropped.
+    STALE_S = 10.0
+    # How long modem frames and decided events are remembered.
+    PLM_MEMORY_S = 30.0
+    # Rate limits on injection.
+    PER_DEVICE_PER_MINUTE = 4
+    GLOBAL_PER_MINUTE = 12
+
+    def __init__(self, mqtt, modem, protocol):
+        """Constructor
+
+        Args:
+          mqtt (mqtt.Mqtt):  The main MQTT handler, used to publish stats
+               and alerts.
+          modem (Modem):  The modem: its address, its devices and its
+                timed_call scheduler.
+          protocol (Protocol):  The protocol stack to inject into and to
+                   learn from what the modem itself read.
+        """
+        self.mqtt = mqtt
+        self.modem = modem
+        self.protocol = protocol
+
+        self.topic = 'insteon-rf/msg/+'
+        self.inject = set()
+        self.shadow = set()
+        self.stats_topic = None
+        self.stats_interval = 300
+        self.alert_topic = None
+
+        # Pending events (dicts: key, t, first, due, frame, msg, heard_by,
+        # repaired), and decided ones kept PLM_MEMORY_S for late copies,
+        # ordering and pairs (key, t, first, heard_by, injected).
+        self._events = []
+        self._decided = []
+        # What the modem read: dicts of key, sender, when, used.  Each read
+        # is credited to at most one event.
+        self._plm = []
+        # Injection times: per sender id, and overall; shadow decisions keep
+        # their own, so they never use up the live budget.
+        self._device_injections = {}
+        self._recent_injections = []
+        self._shadow_device = {}
+        self._shadow_recent = []
+        # After an injection: modem frames to drop (see filter_modem_read).
+        self._guards = []
+        # The one scheduled TimedCall that releases due events.  TimedCall
+        # runs a single call per loop pass, so one per event would make a
+        # burst trickle out.
+        self._tick = None
+
+        # Clock, replaceable in tests.
+        self.clock = time.time
+        self.started = self.clock()
+        self.counts = {'messages': 0, 'not_for_modem': 0, 'no_modem_link': 0,
+                       'plm_heard': 0, 'superseded': 0, 'plm_missed': 0,
+                       'stale': 0, 'late_copies': 0, 'paired': 0,
+                       'split': 0, 'reports': 0, 'late_modem_copies': 0,
+                       'injected': 0, 'shadow': 0, 'rejected': 0,
+                       'rate_limited': 0, 'malformed': 0, 'alerts': 0}
+        self.receivers = {}
+        self.devices = {}
+
+        protocol.signal_raw_read.connect(self.handle_plm_read)
+        protocol.read_filter = self.filter_modem_read
+
+    #-----------------------------------------------------------------------
+    def load_config(self, data):
+        """Load the 'listeners' section of the mqtt config.
+
+        Args:
+          data (dict):  The listeners configuration dictionary.
+        """
+        self.topic = data.get('topic', self.topic)
+        self.inject = set(data.get('inject', []))
+        self.shadow = set(data.get('shadow', [])) - self.inject
+        self.stats_topic = data.get('stats_topic', 'insteon/listeners/stats')
+        self.stats_interval = data.get('stats_interval', self.stats_interval)
+        self.alert_topic = data.get('alert_topic', 'insteon/listeners/alert')
+
+        LOG.info("RF listeners on %s: inject %s, shadow %s", self.topic,
+                 sorted(self.inject) or "none", sorted(self.shadow) or "none")
+
+        if self.stats_topic and self.stats_interval:
+            self.modem.timed_call.add(self.clock() + self.stats_interval,
+                                      self.publish_stats)
+
+    #-----------------------------------------------------------------------
+    def subscribe(self, link, qos):
+        """Subscribe to the listener topic.
+
+        Args:
+          link (network.Mqtt):  The MQTT network client.
+          qos (int):  The quality of service to use.
+        """
+        link.subscribe(self.topic, qos, self.handle_mqtt)
+
+    #-----------------------------------------------------------------------
+    def unsubscribe(self, link):
+        """Unsubscribe from the listener topic.
+
+        Args:
+          link (network.Mqtt):  The MQTT network client.
+        """
+        link.unsubscribe(self.topic)
+
+    #-----------------------------------------------------------------------
+    def handle_mqtt(self, client, userdata, message):
+        """Listener topic callback.
+
+        Args:
+          client (paho.Client):  The paho mqtt client.
+          userdata:  Unused.
+          message:  The incoming MQTT message.
+        """
+        # pylint: disable=unused-argument
+        try:
+            data = json.loads(message.payload.decode("utf-8"))
+        except ValueError:
+            LOG.warning("Listener message on %s is not JSON: %s",
+                        message.topic, message.payload)
+            self.counts['malformed'] += 1
+            return
+        if not isinstance(data, dict):
+            self.counts['malformed'] += 1
+            return
+        self.handle_message(data)
+
+    #-----------------------------------------------------------------------
+    def publish_stats(self):
+        """Publish the counters (retained) and schedule the next time."""
+        if not self.stats_topic:
+            return
+        self.mqtt.publish(self.stats_topic, json.dumps(self.stats()),
+                          retain=True)
+        LOG.info("Counters: %s", self.counts)
+        if self.stats_interval:
+            self.modem.timed_call.add(self.clock() + self.stats_interval,
+                                      self.publish_stats)
+
+    #-----------------------------------------------------------------------
+    def handle_plm_read(self, raw, duplicate):
+        """Protocol.signal_raw_read callback: remember what the modem read.
+
+        Args:
+          raw (bytes):  The complete modem frame that was read.
+          duplicate (bool):  Whether insteon-mqtt judged it a duplicate.
+        """
+        # A duplicate is a second copy of something already recorded; as a
+        # separate read it could be credited to a later, missed, press.
+        if duplicate or len(raw) < 11 or \
+                raw[1] not in (Msg.InpStandard.msg_code,
+                               Msg.InpExtended.msg_code):
+            return
+
+        now = self.clock()
+        self._plm.append({'key': message_key(raw), 'when': now,
+                          'used': False})
+        cutoff = now - self.PLM_MEMORY_S
+        while self._plm and self._plm[0]['when'] < cutoff:
+            self._plm.pop(0)
+
+    #-----------------------------------------------------------------------
+    def handle_message(self, data, now=None):
+        """Process one decoded listener message.
+
+        Args:
+          data (dict):  The parsed JSON payload.
+          now (float):  Current time, for tests.  Defaults to self.clock().
+        """
+        now = self.clock() if now is None else now
+        try:
+            if data.get('v') != 1:
+                raise ValueError("unsupported version %r" % data.get('v'))
+            rx = str(data['rx'])
+            frame = bytes.fromhex(data['frame'])
+            msg = self._parse(frame)
+            t = float(data['t'])
+            repaired = int(data.get('repaired', 0))
+            if not math.isfinite(t):
+                raise ValueError("t is not a finite number")
+        except (KeyError, TypeError, ValueError) as e:
+            LOG.warning("Bad listener message %s: %s", data, e)
+            self.counts['malformed'] += 1
+            return
+
+        # Old news (a backlog, a retained message, a listener with no clock)
+        # must never be handled as a fresh event.
+        if abs(now - t) > self.STALE_S:
+            LOG.info("Stale listener message from %s (%.1f s off), dropped",
+                     rx, now - t)
+            self.counts['stale'] += 1
+            return
+
+        rec = self.receivers.setdefault(rx, {'heard': 0, 'heard_missed': 0,
+                                             'sole_missed': 0})
+        rec['heard'] += 1
+
+        key = message_key(frame)
+        copy = {'rssi': data.get('rssi'), 'snr': data.get('snr'),
+                'copies': data.get('copies', 1)}
+        for event in self._events:
+            if event['key'] == key and abs(event['t'] - t) <= self.SAME_TX_S:
+                event['heard_by'][rx] = copy
+                event['t'] = min(event['t'], t)
+                if repaired < event['repaired']:
+                    event['frame'], event['msg'] = frame, msg
+                    event['repaired'] = repaired
+                return
+        for done in self._decided:
+            if done['key'] == key and abs(done['t'] - t) <= self.SAME_TX_S:
+                # Another listener's late copy of a message already decided.
+                done['heard_by'][rx] = copy
+                self.counts['late_copies'] += 1
+                return
+
+        for other in self._events + self._decided:
+            if other['key'] == key and rx not in other['heard_by'] and \
+                    abs(other['t'] - t) <= self.SPLIT_S:
+                LOG.warning("Listener %s's copy is %.2f s from %s's on air: "
+                            "listener clocks may disagree", rx,
+                            t - other['t'], ", ".join(other['heard_by']))
+                self.counts['split'] += 1
+                break
+
+        event = {'key': key, 't': t, 'first': now, 'due': now + self.GRACE_S,
+                 'frame': frame, 'msg': msg, 'heard_by': {rx: copy},
+                 'repaired': repaired}
+        self._events.append(event)
+        self._schedule(event['due'])
+
+    #-----------------------------------------------------------------------
+    def _schedule(self, when):
+        """Make sure the release tick runs no later than 'when'.
+
+        Args:
+          when (float):  Time an event becomes due.
+        """
+        if self._tick is not None:
+            if self._tick.time <= when:
+                return
+            self.modem.timed_call.remove(self._tick)
+        self._tick = self.modem.timed_call.add(when, self._release_due)
+
+    #-----------------------------------------------------------------------
+    def _release_due(self):
+        """TimedCall callback: release every event whose grace is over."""
+        self._tick = None
+        now = self.clock()
+        due = [e for e in self._events if e['due'] <= now]
+        # Oldest on air first, so a device's messages are handled in order
+        # and a modem read is credited to the earliest matching event.
+        for event in sorted(due, key=lambda e: e['t']):
+            self._events.remove(event)
+            try:
+                self._release(event)
+            except Exception:  # pylint: disable=broad-except
+                # One bad event (or a device handler raising on an injected
+                # message) must not strand the others.
+                LOG.exception("Error deciding listener message %s",
+                              event['msg'])
+        if self._events:
+            self._schedule(min(e['due'] for e in self._events))
+
+    #-----------------------------------------------------------------------
+    def _parse(self, frame):
+        """Parse a modem frame, insisting on the exact length.
+
+        Args:
+          frame (bytes):  The 0x50/0x51 frame.
+
+        Returns:
+          The InpStandard or InpExtended message.
+
+        Raises:
+          ValueError:  If the frame is not a complete inbound message.
+        """
+        if len(frame) < 2 or frame[0] != 0x02:
+            raise ValueError("frame does not start with 0x02")
+        if frame[1] == Msg.InpStandard.msg_code:
+            cls = Msg.InpStandard
+        elif frame[1] == Msg.InpExtended.msg_code:
+            cls = Msg.InpExtended
+        else:
+            raise ValueError("message code %#04x is not an inbound Insteon "
+                             "message" % frame[1])
+        if len(frame) != cls.msg_size(frame):
+            raise ValueError("frame is %d bytes, needs %d" %
+                             (len(frame), cls.msg_size(frame)))
+        return cls.from_bytes(frame)
+
+    #-----------------------------------------------------------------------
+    def _modem_read(self, event, now):
+        """What the modem read that bears on this event.
+
+        Args:
+          event (dict):  The event being decided.
+          now (float):  Release time: the end of the window.
+
+        Returns:
+          str:  'heard' (the modem read this message, or the same bytes
+          within SAME_EVENT_S on air -- a device retransmission), 'paired'
+          (the same event in its other form -- the cleanup of a broadcast or
+          the reverse -- was read or injected), 'newer' (the modem read a
+          later message about the same state from this device), or None.
+        """
+        key, t = event['key'], event['t']
+        lo = event['first'] - self.EARLY_S
+        if self._read_same(key, event['first'], lo, now):
+            return 'heard'
+
+        sender, group, cmd1 = _topic(key)
+        if group is None:
+            return None
+        groups = self._state_groups(event['msg'], group)
+        newer = False
+        on_air = event['first'] - self.LISTENER_LAG_S
+        for read in self._plm:
+            if read['key'] == key or read['when'] > now:
+                continue
+            r_sender, r_group, r_cmd1 = _topic(read['key'])
+            if r_sender != sender or r_group not in groups:
+                continue
+            if r_cmd1 == cmd1 and r_group == group:
+                if _other_form(read['key'], key) and \
+                        abs(read['when'] - on_air) <= self.PAIR_S:
+                    return 'paired'
+                continue
+            if read['when'] >= lo and \
+                    not self._heard_before(read['key'], t, read['when']):
+                newer = True
+        for done in self._decided:
+            if done['injected'] and _other_form(done['key'], key) and \
+                    abs(done['first'] - event['first']) <= self.PAIR_S and \
+                    _topic(done['key']) == (sender, group, cmd1):
+                return 'paired'
+        return 'newer' if newer else None
+
+    #-----------------------------------------------------------------------
+    def _read_same(self, key, first, lo, now):
+        """Whether the modem read this message (crediting that read).
+
+        Args:
+          key (bytes):  The message key.
+          first (float):  When the first listener copy arrived.
+          lo (float):  Start of the window, insteon-mqtt clock.
+          now (float):  Release time: the end of the window.
+
+        Returns:
+          bool
+        """
+        for read in self._plm:
+            if read['key'] == key and not read['used'] and \
+                    lo <= read['when'] <= now:
+                read['used'] = True
+                return True
+        # Already credited to another event, but this close on air it is the
+        # same event: the device's own retransmission.
+        on_air = first - self.LISTENER_LAG_S
+        return any(read['key'] == key and
+                   abs(read['when'] - on_air) <= self.SAME_EVENT_S
+                   for read in self._plm)
+
+    #-----------------------------------------------------------------------
+    def _state_groups(self, msg, group):
+        """The groups that report the same state as this one.
+
+        A leak sensor reports dry on group 1 and wet on group 2, so a later
+        message on either is newer state than a missed one on the other.
+        Everything else keeps its state per group.
+
+        Args:
+          msg:  The message being decided.
+          group (int):  Its group.
+
+        Returns:
+          set
+        """
+        if group in (1, 2) and isinstance(self.modem.find(msg.from_addr),
+                                          Leak):
+            return {1, 2}
+        return {group}
+
+    #-----------------------------------------------------------------------
+    def _heard_before(self, key, t, when):
+        """Whether a modem read is of a message the listeners heard before t.
+
+        The modem's copy of an *earlier* message can arrive after a
+        listener's copy of a later one, so a modem read only counts as newer
+        when the listeners don't place it earlier.  Unknown means newer: the
+        safe direction is not to inject.
+
+        Args:
+          key (bytes):  The message the modem read.
+          t (float):  On-air time of the event being decided.
+          when (float):  When the modem read it.  Only a listener copy that
+               arrived within MATCH_S of the read is the same transmission.
+
+        Returns:
+          bool
+        """
+        for other in self._events + self._decided:
+            if other['key'] == key and 0 < t - other['t'] <= self.ORDER_S \
+                    and abs(other['first'] - when) <= self.MATCH_S:
+                return True
+        return False
+
+    #-----------------------------------------------------------------------
+    def _release(self, event):
+        """Grace period over: decide what to do with one message.
+
+        Args:
+          event (dict):  The event, already removed from the pending list.
+        """
+        now = self.clock()
+        event['injected'] = False
+        self._decided.append(event)
+        self._decided = [e for e in self._decided
+                         if now - e['first'] <= self.PLM_MEMORY_S]
+
+        msg = event['msg']
+        self.counts['messages'] += 1
+
+        # The modem's own transmissions are heard on RF but never come back
+        # as inbound messages, so they are neither heard nor missed.
+        if self.modem.addr is not None and msg.from_addr == self.modem.addr:
+            return
+
+        # Direct and cleanup messages to another device: the modem never
+        # passes those up, so they are neither heard nor missed by it.
+        flag_type = msg.flags.type
+        if flag_type not in (Msg.Flags.Type.ALL_LINK_BROADCAST,
+                             Msg.Flags.Type.BROADCAST) and \
+                msg.to_addr != self.modem.addr:
+            self.counts['not_for_modem'] += 1
+            return
+
+        dev = self.devices.setdefault(msg.from_addr.hex, {
+            'messages': 0, 'plm_missed': 0, 'injected': 0, 'shadow': 0})
+        dev['messages'] += 1
+
+        # A cleanup status report (0x06) carries no state of its own: it is
+        # neither injected nor counted as a miss.
+        if flag_type == Msg.Flags.Type.ALL_LINK_BROADCAST and \
+                msg.cmd1 == 0x06:
+            self.counts['reports'] += 1
+            return
+
+        # A group broadcast the modem has no link for is never passed up by
+        # it, so it is neither heard nor missed.  (Group 0 still alerts.)
+        if flag_type == Msg.Flags.Type.ALL_LINK_BROADCAST and \
+                msg.group != 0 and not self._modem_linked(msg):
+            self.counts['no_modem_link'] += 1
+            return
+
+        read = self._modem_read(event, now)
+        if read == 'heard':
+            self.counts['plm_heard'] += 1
+            return
+        if read == 'paired':
+            self.counts['paired'] += 1
+            return
+        if read == 'newer':
+            # The modem missed this but has since handled something later
+            # for the same group from the same device (a close after an
+            # open): injecting now would replay old state.
+            LOG.info("Not injecting a message the modem missed: it has "
+                     "since read a later one from %s: %s", msg.from_addr, msg)
+            self.counts['superseded'] += 1
+            return
+
+        self._count_missed(event, dev)
+
+        tier, why = self._classify(msg, event)
+        if tier is None:
+            LOG.debug("Listener message not handled (%s): %s", why, msg)
+            self.counts['rejected'] += 1
+            return
+
+        if tier not in self.inject and tier not in self.shadow:
+            return
+
+        limit = self._rate_limited(msg.from_addr, now, tier in self.shadow)
+        if limit:
+            LOG.info("Listener %s message rate limited (%s): %s", tier,
+                     limit, msg)
+            self.counts['rate_limited'] += 1
+            return
+
+        heard_by = ", ".join(sorted(event['heard_by']))
+        if tier in self.shadow:
+            LOG.info("Would inject %s message missed by the "
+                     "modem, heard by %s: %s", tier, heard_by, msg)
+            self.counts['shadow'] += 1
+            dev['shadow'] += 1
+            # Counts for the pair rule and the rate limits too, so shadow
+            # mirrors live.
+            event['injected'] = True
+            self._shadow_device.setdefault(msg.from_addr.id, []).append(now)
+            self._shadow_recent.append(now)
+            return
+
+        LOG.info("Injecting %s message missed by the modem, "
+                 "heard by %s: %s", tier, heard_by, msg)
+        self._device_injections.setdefault(msg.from_addr.id, []).append(now)
+        self._recent_injections.append(now)
+        event['injected'] = True
+        self._guard(event, now)
+        if self.protocol.inject(event['frame']):
+            self.counts['injected'] += 1
+            dev['injected'] += 1
+
+    #-----------------------------------------------------------------------
+    def _guard(self, event, now):
+        """Arrange for the modem's own late copies of an injected event to
+        be dropped (insteon-mqtt's duplicate window is far shorter).
+
+        Args:
+          event (dict):  The event being injected.
+          now (float):  Current time.
+        """
+        on_air = event['first'] - self.LISTENER_LAG_S
+        self._guards = [g for g in self._guards if g['until'] > now]
+        self._guards.append({'key': event['key'], 'other': False,
+                             'until': now + self.STRAGGLER_S})
+        self._guards.append({'key': event['key'], 'other': True,
+                             'until': on_air + self.PAIR_S})
+
+    #-----------------------------------------------------------------------
+    def filter_modem_read(self, raw):
+        """Protocol.read_filter: drop the modem's late copy of an injection.
+
+        After a message is injected, the modem may still read it late, or
+        read the other form of the same event (the cleanup after a
+        broadcast).  Handling that would process the event twice.  Each
+        guard is used once.
+
+        Args:
+          raw (bytes):  A frame read from the modem.
+
+        Returns:
+          bool:  True to drop it.
+        """
+        if not self._guards or len(raw) < 11 or \
+                raw[1] not in (Msg.InpStandard.msg_code,
+                               Msg.InpExtended.msg_code):
+            return False
+        now = self.clock()
+        key = message_key(raw)
+        self._guards = [g for g in self._guards if g['until'] > now]
+        for g in self._guards:
+            if g['other']:
+                hit = _other_form(g['key'], key) and \
+                    _topic(g['key']) == _topic(key)
+            else:
+                hit = g['key'] == key
+            if hit:
+                self._guards.remove(g)
+                self.counts['late_modem_copies'] += 1
+                return True
+        return False
+
+    #-----------------------------------------------------------------------
+    def _count_missed(self, event, dev):
+        """Count a message the modem missed, per device and per listener.
+
+        Args:
+          event (dict):  The released event.
+          dev (dict):  The sender's counters.
+        """
+        self.counts['plm_missed'] += 1
+        dev['plm_missed'] += 1
+        for rx in event['heard_by']:
+            self.receivers[rx]['heard_missed'] += 1
+        if len(event['heard_by']) == 1:
+            rx = next(iter(event['heard_by']))
+            self.receivers[rx]['sole_missed'] += 1
+
+    #-----------------------------------------------------------------------
+    def _modem_linked(self, msg):
+        """Whether the modem holds a responder link for a group broadcast.
+
+        Args:
+          msg:  An ALL-Link broadcast message.
+
+        Returns:
+          bool:  False also while the modem's database is not loaded yet,
+          which is the safe direction.
+        """
+        return self.modem.db.find(msg.from_addr, msg.group, False) is not None
+
+    #-----------------------------------------------------------------------
+    def _classify(self, msg, event):
+        """Pick the tier of a message the modem missed.
+
+        Args:
+          msg:  The InpStandard or InpExtended message.
+          event (dict):  The pending event.
+
+        Returns:
+          (str, str):  (tier or None, reason when None).
+        """
+        flag_type = msg.flags.type
+        if event['repaired']:
+            return None, "repaired by the listener"
+        if flag_type in _REPLY_TYPES:
+            return None, "ACK/NAK"
+        if flag_type == Msg.Flags.Type.ALL_LINK_BROADCAST and msg.group == 0:
+            self._alert(msg, event)
+            return None, "group 0"
+
+        device = self.modem.find(msg.from_addr)
+        if device is None:
+            return None, "unknown sender"
+
+        broadcast = flag_type in (Msg.Flags.Type.ALL_LINK_BROADCAST,
+                                  Msg.Flags.Type.BROADCAST)
+
+        if isinstance(device, BatterySensor) and (
+                broadcast or flag_type in _GROUP_TYPES):
+            return 'battery', None
+        if flag_type in _GROUP_TYPES:
+            return 'group', None
+        return 'state', None
+
+    #-----------------------------------------------------------------------
+    def _rate_limited(self, addr, now, shadow):
+        """Check the injection rate limits.
+
+        Shadow decisions have their own budget, so they show what live
+        injection would do without ever using up the live one.
+
+        Args:
+          addr (Address):  The sender.
+          now (float):  Current time.
+          shadow (bool):  Whether this is a shadow decision.
+
+        Returns:
+          str:  Which limit applies, or None.
+        """
+        per_device = self._shadow_device if shadow else \
+            self._device_injections
+        recent = self._shadow_recent if shadow else self._recent_injections
+        mine = [t for t in per_device.get(addr.id, []) if now - t < 60]
+        per_device[addr.id] = mine
+        if len(mine) >= self.PER_DEVICE_PER_MINUTE:
+            return "per device"
+        recent[:] = [t for t in recent if now - t < 60]
+        if len(recent) >= self.GLOBAL_PER_MINUTE:
+            return "global"
+        return None
+
+    #-----------------------------------------------------------------------
+    def _alert(self, msg, event):
+        """Publish an alert for a group 0 broadcast (a phantom 'all on').
+
+        Args:
+          msg:  The message.
+          event (dict):  The pending event.
+        """
+        self.counts['alerts'] += 1
+        LOG.warning("Group 0 broadcast from %s cmd %#04x, heard "
+                    "by %s", msg.from_addr, msg.cmd1,
+                    ", ".join(sorted(event['heard_by'])))
+        if self.alert_topic:
+            payload = json.dumps({
+                'alert': 'all-link-group-0', 't': round(event['t'], 3),
+                'from': msg.from_addr.hex, 'cmd1': msg.cmd1,
+                'cmd2': msg.cmd2, 'heard_by': event['heard_by']})
+            self.mqtt.publish(self.alert_topic, payload, retain=False)
+
+    #-----------------------------------------------------------------------
+    def stats(self):
+        """Current counters, as published on the stats topic.
+
+        Returns:
+          dict
+        """
+        return {'since': round(self.started), 'counts': dict(self.counts),
+                'receivers': self.receivers, 'devices': self.devices}
+
+
+#===========================================================================
+__all__ = ['Listeners', 'TIERS', 'message_key']

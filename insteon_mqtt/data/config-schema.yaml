@@ -305,6 +305,26 @@ mqtt:
     discovery_topic_base: *mqtt_topic
     discovery_ha_status: *mqtt_topic
     device_info_template: *discovery_device
+    # RF listeners (Listeners.py).  Declared here because unknown keys under
+    # mqtt: are validated as user-defined discovery classes.
+    listeners:
+      type: dict
+      schema:
+        # A subscription, so MQTT wildcards are allowed.
+        topic:
+          type: string
+          empty: false
+        inject: &listener_tiers
+          type: list
+          schema:
+            type: string
+            allowed: ['battery', 'group', 'state']
+        shadow: *listener_tiers
+        stats_topic: *mqtt_topic
+        stats_interval:
+          type: integer
+          min: 0
+        alert_topic: *mqtt_topic
     modem:
       type: dict
       allow_unknown: True

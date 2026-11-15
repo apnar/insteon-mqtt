@@ -213,4 +213,42 @@ mqtt:
   # TO ENABLE THE DISCOVERY PLATFORM: Set the following to true
   enable_discovery: false
 
+  #==================================================================
+  # RF listeners
+  #==================================================================
+  # The modem hears only what reaches its own antenna.  Battery devices
+  # (leak, door, motion, remotes) are RF only and can't be polled, so a
+  # message the modem misses from one of them is lost.  Receive-only RF
+  # listeners elsewhere in the house (for example a LilyGO T-Embed CC1101
+  # running ESPHome, or an RTL-SDR) can publish what they decode here.
+  # Messages the modem missed are then handled as though it had heard them.
+  # Nothing is ever transmitted; the modem stays the only transmitter.
+  #
+  # Each listener publishes JSON to its own topic:
+  #   {"v": 1, "rx": "t-embed", "t": 1794759872.429,
+  #    "frame": "0250...", "copies": 3, "hops_left": 2,
+  #    "rssi": -78.5, "snr": null, "repaired": 0}
+  # where "frame" is the message as the modem would have reported it.
+  #
+  # A message is only considered if the modem did not read it, has not
+  # since read a newer message for the same group from the same device, and
+  # (for a group broadcast) holds a link for that group.  Tiers:  battery = broadcasts
+  # and cleanups from battery devices; group = any group broadcast or
+  # cleanup; state = other messages to the modem.  Replies (ACK/NAK),
+  # cleanup status reports, the modem's own messages, unknown senders,
+  # repaired messages and group 0 broadcasts are never handled.  Tiers in
+  # "shadow" are only logged ("would inject"), so a tier can be watched
+  # before it is turned on.  Injection is rate limited (4 per device, 12
+  # overall, per minute; shadow has its own budget).
+  #
+  # listeners:
+  #   topic: 'insteon-rf/msg/+'
+  #   inject: ['battery']
+  #   shadow: ['group', 'state']
+  #   # Counters per listener and per device, published retained.
+  #   stats_topic: 'insteon/listeners/stats'
+  #   stats_interval: 300
+  #   # A group 0 broadcast ("all on") heard by a listener.
+  #   alert_topic: 'insteon/listeners/alert'
+
 #----------------------------------------------------------------
